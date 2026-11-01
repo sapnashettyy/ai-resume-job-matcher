@@ -4,3 +4,5 @@ pymupdf
 python-docx
 ollama
 python-dotenv
+requests
+beautifulsoup4

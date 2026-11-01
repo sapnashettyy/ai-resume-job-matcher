@@ -58,6 +58,83 @@ def _clean_list(value, limit=20):
             break
     return result
 
+
+# Deterministic backup for small local models that return an empty required_skills list.
+# This is deliberately limited to common technical skills and only detects terms present
+# in the supplied job description; it does not invent requirements.
+_SKILL_PATTERNS = [
+    ("Python", r"\bpython\b"),
+    ("Data Structures and Algorithms", r"\bdata structures?\b|\balgorithms?\b|\bDSA\b"),
+    ("Object-Oriented Programming (OOP)", r"\bobject[- ]oriented programming\b|\bOOP\b"),
+    ("SQL", r"\bSQL\b"),
+    ("MySQL", r"\bMySQL\b"),
+    ("PostgreSQL", r"\bPostgreSQL\b"),
+    ("REST APIs", r"\bREST\s*APIs?\b|\bRESTful APIs?\b"),
+    ("Git and GitHub", r"\bGitHub\b|\bGit\b"),
+    ("Debugging", r"\bdebug(?:ging|ger)?\b"),
+    ("Problem-solving", r"\bproblem[- ]solving\b"),
+    ("FastAPI", r"\bFastAPI\b"),
+    ("Flask", r"\bFlask\b"),
+    ("MongoDB", r"\bMongoDB\b"),
+    ("HTML", r"\bHTML5?\b"),
+    ("CSS", r"\bCSS3?\b"),
+    ("JavaScript", r"\bJavaScript\b"),
+    ("Machine Learning", r"\bmachine learning\b"),
+    ("Docker", r"\bDocker\b"),
+    ("PostgreSQL", r"\bPostgreSQL\b"),
+    ("Database Management", r"\bdatabase management\b|\bdatabases?\b"),
+    ("Communication", r"\bcommunication\b"),
+    ("Teamwork", r"\bteamwork\b"),
+    ("Time Management", r"\btime management\b"),
+]
+
+
+def _fallback_extract_required_skills(job_description):
+    """Extract recognizable skill terms from the JD if the LLM returns none."""
+    text = re.sub(r"\s+", " ", job_description)
+    if not text.strip():
+        return []
+
+    # If the JD has an explicit required-skills section, use that section first.
+    required_match = re.search(
+        r"(?:required skills|required qualifications|requirements|qualifications|must have)"
+        r"\s*:?\s*(.*?)(?=(?:preferred skills|preferred qualifications|nice to have|responsibilities|what you'll do|soft skills|eligibility)\b|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    scan_text = required_match.group(1) if required_match else text
+
+    # If there is no explicit required section, do not accidentally treat terms
+    # appearing only under a preferred-skills heading as mandatory.
+    if not required_match:
+        scan_text = re.split(
+            r"\b(?:preferred skills|preferred qualifications|nice to have)\b",
+            text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+    found = []
+    for canonical, pattern in _SKILL_PATTERNS:
+        if re.search(pattern, scan_text, flags=re.IGNORECASE):
+            if canonical.casefold() not in {x.casefold() for x in found}:
+                found.append(canonical)
+    return found[:20]
+
+
+def _resume_mentions_skill(skill, resume_text):
+    """Conservative literal/alias check used only when the model omitted all classifications."""
+    aliases = {
+        "data structures and algorithms": r"\bdata structures?\b|\balgorithms?\b|\bDSA\b",
+        "object-oriented programming (oop)": r"\bobject[- ]oriented programming\b|\bOOP\b",
+        "rest apis": r"\bREST\s*APIs?\b|\bRESTful APIs?\b",
+        "git and github": r"\bGitHub\b|\bGit\b",
+        "problem-solving": r"\bproblem[- ]solving\b|\bproblem solving\b",
+        "database management": r"\bdatabases?\b|\bSQL\b|\bMySQL\b|\bPostgreSQL\b",
+    }
+    pattern = aliases.get(skill.casefold(), r"(?<!\w)" + re.escape(skill) + r"(?!\w)")
+    return bool(re.search(pattern, resume_text, flags=re.IGNORECASE))
+
 def _fallback_evidence(required, matched, missing, unclear):
     """Build a conservative evidence table if the model omits one."""
     matched_set = {x.casefold() for x in matched}
@@ -133,11 +210,11 @@ JOB DESCRIPTION:
                 },
                 {"role": "user", "content": prompt},
             ],
-            format=OUTPUT_SCHEMA,
+            format="json",
             options={
                 "temperature": 0,
                 "num_ctx": 4096,
-                "num_predict": 900,
+                "num_predict": 1400,
             },
             keep_alive="10m",
         )
@@ -172,9 +249,22 @@ JOB DESCRIPTION:
 
     required = result["required_skills"]
     if not required:
-        raise ValueError(
-            "No required skills could be extracted. Check that the job description includes role requirements."
-        )
+        # Small local models occasionally return an empty list despite a valid JD.
+        # Recover by extracting known skill terms directly from the JD.
+        required = _fallback_extract_required_skills(job_description)
+        if not required:
+            raise ValueError(
+                "No required skills could be extracted. Add a 'Required skills' section "
+                "with specific skills such as Python, SQL, Git, or REST APIs."
+            )
+        result["required_skills"] = required
+
+        # When the model returned no usable required-skill classifications, make a
+        # conservative literal check against the resume instead of marking everything matched.
+        matched_fallback = [skill for skill in required if _resume_mentions_skill(skill, resume_text)]
+        result["matched_skills"] = matched_fallback
+        result["missing_required_skills"] = [skill for skill in required if skill not in matched_fallback]
+        result["unclear_skills"] = []
 
     # Canonicalize the categories to the required-skill names and enforce exclusivity.
     def find_required(items):
