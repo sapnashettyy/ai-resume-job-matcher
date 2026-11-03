@@ -1,4 +1,5 @@
 import html
+import hashlib
 
 import json
 
@@ -10,7 +11,7 @@ import streamlit as st
 
 from resume_parser import extract_resume_text
 
-from llm_analyzer import analyze_resume
+from llm_analyzer import analyze_resume, generate_job_keywords, generate_skill_to_role_pathways
 from job_discovery_agent import search_jobs_fast
 
 # --------------------------------------------------
@@ -933,7 +934,7 @@ if analysis:
         st.markdown("**Preferred skills**")
         render_skill_tags(preferred, "#9475FF")
 
-    st.markdown("### Personalized recommendations")
+    st.markdown("### Skills to learn for your next career role")
     if suggestions:
         for number, suggestion in enumerate(suggestions, start=1):
             st.markdown(
@@ -941,84 +942,7 @@ if analysis:
                 unsafe_allow_html=True,
             )
     else:
-        st.info("No recommendations were returned.")
-
-    st.markdown("### Find matching jobs & internships")
-    st.caption(
-        "Search public job boards separately from resume analysis. "
-        "Listings and eligibility depend on each source."
-    )
-    job_query = st.text_input(
-        "Job search keywords",
-        value="python developer intern",
-        key="talentlens_job_query",
-        placeholder="e.g. Python intern, data analyst fresher",
-    )
-    if st.button(
-        "🔎 Find Matching Jobs",
-        key="talentlens_find_jobs",
-        use_container_width=True,
-    ):
-        if not job_query.strip():
-            st.warning("Enter a job title or skill to search.")
-        else:
-            with st.spinner("Searching public job boards…"):
-                try:
-                    job_result = search_jobs_fast(job_query.strip(), max_results=12)
-                    st.session_state["talentlens_job_result"] = job_result
-                    st.session_state["talentlens_job_query_last"] = job_query.strip()
-                except Exception as job_error:
-                    st.session_state["talentlens_job_result"] = {
-                        "jobs": [],
-                        "search_links": [],
-                        "errors": [str(job_error)],
-                    }
-                    st.session_state["talentlens_job_query_last"] = job_query.strip()
-
-    job_result = st.session_state.get("talentlens_job_result")
-    if job_result:
-        st.caption(
-            f"Results for: {st.session_state.get('talentlens_job_query_last', job_query)}"
-        )
-        jobs = job_result.get("jobs", [])
-        if jobs:
-            st.success(
-                f"Found {len(jobs)} matching listing(s). Check each listing for current availability and eligibility."
-            )
-            for job in jobs:
-                title = str(job.get("title", "Job title not provided"))
-                company = str(job.get("company", "Company not specified"))
-                location = str(job.get("location", "Location not specified"))
-                source = str(job.get("source", "Job board"))
-                url = str(job.get("url", ""))
-                remote_note = " · Remote" if job.get("remote") else ""
-                with st.container(border=True):
-                    if url.startswith(("https://", "http://")):
-                        st.markdown(f"**[{html.escape(title)}]({url})**")
-                        st.markdown(f"[Open application / listing ↗]({url})")
-                    else:
-                        st.markdown(f"**{html.escape(title)}**")
-                    st.write(f"{company} · {location}{remote_note}")
-                    st.caption(f"Source: {source}")
-                    description = re.sub(r"<[^>]+>", " ", str(job.get("description", "")))
-                    description = re.sub(r"\s+", " ", description).strip()
-                    if description:
-                        st.write(description[:320] + ("…" if len(description) > 320 else ""))
-        else:
-            st.warning(
-                "No matching entry-level listings were found from the connected public sources right now."
-            )
-        if job_result.get("errors"):
-            with st.expander("Job source status"):
-                for source_error in job_result["errors"]:
-                    st.caption(str(source_error))
-        links = job_result.get("search_links", [])
-        if links:
-            st.markdown("**More job-search links**")
-            for link in links:
-                link_title = html.escape(str(link.get("title", "Search jobs")))
-                link_url = str(link.get("url", "#"))
-                st.markdown(f"- [{link_title}]({link_url})")
+        st.info("No skill-to-role pathways were returned. Try analyzing again for tailored learning suggestions.")
 
     report = {
         "match_score_percent": match_score,
@@ -1038,6 +962,207 @@ if analysis:
         mime="application/json",
         use_container_width=True,
     )
+
+# --------------------------------------------------
+# RESUME-BASED JOB DISCOVERY (works without a job description)
+# --------------------------------------------------
+
+st.markdown("---")
+st.markdown("## Explore career roles, skills to learn & jobs")
+st.caption(
+    "Get evidence-supported roles you can search for now, plus learning pathways showing which missing skills to build for adjacent roles. "
+    "A job description is not required for this section."
+)
+
+if "talentlens_resume_fingerprint" not in st.session_state:
+    st.session_state["talentlens_resume_fingerprint"] = None
+if "talentlens_resume_text" not in st.session_state:
+    st.session_state["talentlens_resume_text"] = ""
+if "talentlens_job_keywords" not in st.session_state:
+    st.session_state["talentlens_job_keywords"] = []
+if "talentlens_job_query" not in st.session_state:
+    st.session_state["talentlens_job_query"] = ""
+if "talentlens_skill_pathways" not in st.session_state:
+    st.session_state["talentlens_skill_pathways"] = []
+
+if resume_file is not None:
+    current_fingerprint = hashlib.sha256(resume_file.getvalue()).hexdigest()
+    if st.session_state["talentlens_resume_fingerprint"] != current_fingerprint:
+        st.session_state["talentlens_resume_fingerprint"] = current_fingerprint
+        st.session_state["talentlens_resume_text"] = ""
+        st.session_state["talentlens_job_keywords"] = []
+        st.session_state["talentlens_job_query"] = ""
+        st.session_state["talentlens_skill_pathways"] = []
+        st.session_state.pop("talentlens_job_result", None)
+        st.session_state.pop("talentlens_job_query_last", None)
+
+suggest_col, hint_col = st.columns([1, 2])
+with suggest_col:
+    suggest_clicked = st.button(
+        "✨ Suggest Roles & Skills to Learn",
+        key="talentlens_suggest_job_keywords",
+        use_container_width=True,
+        disabled=resume_file is None,
+    )
+with hint_col:
+    st.caption("The local Qwen model separates roles supported by your current evidence from future roles you can work toward by learning specific skills.")
+
+if suggest_clicked:
+    try:
+        with st.spinner("Reading your resume and generating role suggestions and learning pathways..."):
+            if not st.session_state["talentlens_resume_text"]:
+                parsed_resume = extract_resume_text(
+                    resume_file.name, resume_file.getvalue()
+                )
+                if not parsed_resume or not parsed_resume.strip():
+                    raise ValueError(
+                        "No readable text was found. Please upload a text-based PDF or DOCX resume."
+                    )
+                st.session_state["talentlens_resume_text"] = parsed_resume
+            suggested = generate_job_keywords(st.session_state["talentlens_resume_text"])
+            if isinstance(suggested, str):
+                suggested = [item.strip() for item in re.split(r"[,\n;]+", suggested) if item.strip()]
+            suggested = unique_strings(
+                [str(item).strip() for item in suggested if str(item).strip()]
+            ) if suggested else []
+            if not suggested:
+                st.warning("The model did not return any keywords. You can enter a job title manually.")
+            else:
+                st.session_state["talentlens_job_keywords"] = suggested
+                # Start the editable search field with the first evidence-supported role.
+                st.session_state["talentlens_job_query"] = suggested[0]
+                st.success("Evidence-supported job roles generated from your resume.")
+
+            # Separate aspirational learning pathways from current-fit job titles.
+            try:
+                st.session_state["talentlens_skill_pathways"] = generate_skill_to_role_pathways(
+                    st.session_state["talentlens_resume_text"]
+                )
+            except Exception as pathway_error:
+                st.session_state["talentlens_skill_pathways"] = []
+                st.warning("Role suggestions were generated, but learning pathways could not be created this time.")
+                with st.expander("Learning-pathway details"):
+                    st.code(str(pathway_error))
+    except (ValueError, RuntimeError) as error:
+        st.error(str(error))
+        st.info("If the error mentions Ollama, check that Ollama is running and the configured model is installed.")
+    except Exception as error:
+        st.error("Could not generate job keywords. You can still search using your own keywords.")
+        with st.expander("Technical details"):
+            st.code(str(error))
+
+keywords = st.session_state.get("talentlens_job_keywords", [])
+pathways = st.session_state.get("talentlens_skill_pathways", [])
+if pathways:
+    st.markdown("### Skills to learn to work toward new roles")
+    st.caption("These are learning pathways, not claims that you already qualify for the roles. Each pathway is grounded in evidence from your resume.")
+    for index, pathway in enumerate(pathways, start=1):
+        with st.container(border=True):
+            st.markdown(f"**{index}. {html.escape(pathway['target_role'])}**")
+            st.caption("Your resume evidence")
+            st.write(f"“{pathway['current_evidence_quote']}”")
+            st.write(pathway["current_foundation"])
+            st.markdown("**Skills to learn next**")
+            st.write(" · ".join(pathway["skills_to_learn"]))
+            st.markdown("**Project idea to practise them**")
+            st.write(pathway["next_project"])
+            st.markdown("**How this helps**")
+            st.write(pathway["why_it_helps"])
+elif st.session_state.get("talentlens_resume_text"):
+    st.info("No evidence-grounded learning pathways were returned. Try again; the app will not invent roles just to fill the list.")
+
+if keywords:
+    selected_keyword = st.selectbox(
+        "Suggested roles",
+        options=keywords,
+        key="talentlens_selected_job_keyword",
+    )
+    if st.button("Use selected suggestion", key="talentlens_use_selected_keyword"):
+        st.session_state["talentlens_job_query"] = selected_keyword
+
+job_query = st.text_input(
+    "Role to search",
+    key="talentlens_job_query",
+    placeholder="Choose a suggested role or enter a job title",
+    help="Choose a role suggested from your resume, or enter another role to search.",
+)
+
+if st.button(
+    "🔎 Find Jobs for This Role",
+    key="talentlens_find_jobs",
+    use_container_width=True,
+):
+    if not job_query.strip():
+        st.warning("Enter a job title or skill to search.")
+    else:
+        with st.spinner("Searching public job boards..."):
+            try:
+                job_result = search_jobs_fast(job_query.strip(), max_results=12)
+                st.session_state["talentlens_job_result"] = job_result
+                st.session_state["talentlens_job_query_last"] = job_query.strip()
+            except Exception as job_error:
+                st.session_state["talentlens_job_result"] = {
+                    "jobs": [],
+                    "search_links": [],
+                    "errors": [str(job_error)],
+                }
+                st.session_state["talentlens_job_query_last"] = job_query.strip()
+
+job_result = st.session_state.get("talentlens_job_result")
+if job_result:
+    st.caption(
+        f"Results for: {st.session_state.get('talentlens_job_query_last', job_query)}"
+    )
+    jobs = job_result.get("jobs", [])
+    if jobs:
+        st.success(
+            f"Found {len(jobs)} matching listing(s). Check each listing for current availability and eligibility."
+        )
+        for job in jobs:
+            title = str(job.get("title", "Job title not provided"))
+            company = str(job.get("company", "Company not specified"))
+            location = str(job.get("location", "Location not specified"))
+            source = str(job.get("source", "Job board"))
+            url = str(job.get("url", ""))
+            remote_note = " · Remote" if job.get("remote") else ""
+            with st.container(border=True):
+                if url.startswith(("https://", "http://")):
+                    st.markdown(f"**[{html.escape(title)}]({url})**")
+                    st.markdown(f"[Open application / listing ↗]({url})")
+                else:
+                    st.markdown(f"**{html.escape(title)}**")
+                st.write(f"{company} · {location}{remote_note}")
+                st.caption(f"Source: {source}")
+                eligibility_status = job.get(
+                    "india_eligibility_status",
+                    "Applicant location eligibility is not verified."
+                )
+                st.caption(f"Eligibility: {eligibility_status}")
+                seniority_note = job.get("seniority_note")
+                if seniority_note:
+                    st.caption(f"Seniority: {seniority_note}")
+                description = re.sub(r"<[^>]+>", " ", str(job.get("description", "")))
+                description = re.sub(r"\s+", " ", description).strip()
+                if description:
+                    st.write(description[:320] + ("…" if len(description) > 320 else ""))
+    else:
+        st.warning(
+            "No relevant listings passed the role filters from the connected public sources right now. "
+            "Try a related title or use the job-search links below. Listings without clear seniority "
+            "may appear when relevant, but verify experience requirements before applying."
+        )
+    if job_result.get("errors"):
+        with st.expander("Job source status"):
+            for source_error in job_result["errors"]:
+                st.caption(str(source_error))
+    links = job_result.get("search_links", [])
+    if links:
+        st.markdown("**More job-search links**")
+        for link in links:
+            link_title = html.escape(str(link.get("title", "Search jobs")))
+            link_url = str(link.get("url", "#"))
+            st.markdown(f"- [{link_title}]({link_url})")
+
 
 # --------------------------------------------------
 
